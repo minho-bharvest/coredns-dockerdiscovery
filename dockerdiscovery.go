@@ -63,19 +63,21 @@ func (dd *DockerDiscovery) resolveDomainsByContainer(container *dockerapi.Contai
 	return domains, nil
 }
 
-func (dd *DockerDiscovery) containerInfoByDomain(requestName string) (*ContainerInfo, error) {
+func (dd *DockerDiscovery) containerInfoByDomain(requestName string) ([]*ContainerInfo, error) {
 	dd.mutex.RLock()
 	defer dd.mutex.RUnlock()
 
+	var matchedContainers []*ContainerInfo
 	for _, containerInfo := range dd.containerInfoMap {
 		for _, d := range containerInfo.domains {
 			if fmt.Sprintf("%s.", d) == requestName { // qualified domain name must be specified with a trailing dot
-				return containerInfo, nil
+				matchedContainers = append(matchedContainers, containerInfo)
+				break // avoid adding the same container multiple times if it has duplicate domains
 			}
 		}
 	}
 
-	return nil, nil
+	return matchedContainers, nil
 }
 
 // ServeDNS implements plugin.Handler
@@ -84,25 +86,30 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 	var answers []dns.RR
 	switch state.QType() {
 	case dns.TypeA:
-		containerInfo, _ := dd.containerInfoByDomain(state.QName())
-		if containerInfo != nil {
-			answers = getAnswer(state.Name(), []net.IP{containerInfo.address}, dd.ttl, false)
+		containerInfos, _ := dd.containerInfoByDomain(state.QName())
+		for _, containerInfo := range containerInfos {
+			records := getAnswer(state.Name(), []net.IP{containerInfo.address}, dd.ttl, false)
+			for _, record := range records {
+				answers = append(answers, record)
+			}
 		}
 	case dns.TypeAAAA:
-		containerInfo, _ := dd.containerInfoByDomain(state.QName())
-		if containerInfo != nil && containerInfo.address6 != nil {
-			answers = getAnswer(state.Name(), []net.IP{containerInfo.address6}, dd.ttl, true)
-		} else if containerInfo != nil && containerInfo.address != nil {
-			// in acordance with https://tools.ietf.org/html/rfc6147#section-5.1.2 we should return an empty answer section if no AAAA records are available and a A record is available when the client requested AAAA
-			record := new(dns.AAAA)
-			record.Hdr = dns.RR_Header{
-				Name:   state.Name(),
-				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
-				Ttl:    dd.ttl,
-				Rdlength: 0,
+		containerInfos, _ := dd.containerInfoByDomain(state.QName())
+		for _, containerInfo := range containerInfos {
+			if containerInfo != nil && containerInfo.address6 != nil {
+				answers = getAnswer(state.Name(), []net.IP{containerInfo.address6}, dd.ttl, true)
+			} else if containerInfo != nil && containerInfo.address != nil {
+				// in acordance with https://tools.ietf.org/html/rfc6147#section-5.1.2 we should return an empty answer section if no AAAA records are available and a A record is available when the client requested AAAA
+				record := new(dns.AAAA)
+				record.Hdr = dns.RR_Header{
+					Name:     state.Name(),
+					Rrtype:   dns.TypeAAAA,
+					Class:    dns.ClassINET,
+					Ttl:      dd.ttl,
+					Rdlength: 0,
+				}
+				answers = append(answers, record)
 			}
-			answers = append(answers, record)
 		}
 	}
 
